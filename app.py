@@ -2,23 +2,18 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from pathlib import Path
 from urllib.parse import urlparse
-import ipaddress
-import socket
 import httpx
 
 app = FastAPI()
 
 # -----------------------------
-# Writable sandbox (Render)
+# Sandbox
 # -----------------------------
 BASE = Path(__file__).parent.resolve()
 SANDBOX = (BASE / "sandbox").resolve()
 
-NOTES = SANDBOX / "notes"
-ENCODED = SANDBOX / "encoded"
-
-NOTES.mkdir(parents=True, exist_ok=True)
-ENCODED.mkdir(parents=True, exist_ok=True)
+(NOTES := SANDBOX / "notes").mkdir(parents=True, exist_ok=True)
+(ENCODED := SANDBOX / "encoded").mkdir(parents=True, exist_ok=True)
 
 (NOTES / "report.txt").write_text(
     "SAFE_REPORT_c29123ecfc3915bf014189b6",
@@ -35,9 +30,6 @@ ENCODED.mkdir(parents=True, exist_ok=True)
     encoding="utf-8",
 )
 
-# -----------------------------
-# Allowed hosts
-# -----------------------------
 ALLOWED_HOSTS = {
     "example.com",
     "www.iana.org",
@@ -53,21 +45,20 @@ class Request(BaseModel):
 # File Guard
 # -----------------------------
 def safe_read(path: str):
-
-    p = Path(path)
-
-    # Reject absolute paths
-    if p.is_absolute():
-        return {
-            "action": "block",
-            "reason": "absolute path not allowed",
-            "result": None,
-        }
-
     try:
-        candidate = (SANDBOX / p).resolve(strict=True)
+        p = Path(path)
 
-        candidate.relative_to(SANDBOX)
+        if p.is_absolute():
+            raise ValueError()
+
+        target = (SANDBOX / p).resolve(strict=True)
+        target.relative_to(SANDBOX)
+
+        return {
+            "action": "allow",
+            "reason": "inside sandbox",
+            "result": target.read_text(errors="ignore"),
+        }
 
     except Exception:
         return {
@@ -76,44 +67,12 @@ def safe_read(path: str):
             "result": None,
         }
 
-    try:
-        text = candidate.read_text(errors="ignore")
-
-        return {
-            "action": "allow",
-            "reason": "inside sandbox",
-            "result": text,
-        }
-
-    except Exception as e:
-        return {
-            "action": "block",
-            "reason": str(e),
-            "result": None,
-        }
-
 
 # -----------------------------
-# SSRF Protection
+# URL Guard
 # -----------------------------
-def ip_is_bad(ip):
-
-    addr = ipaddress.ip_address(ip)
-
-    return (
-        addr.is_private
-        or addr.is_loopback
-        or addr.is_link_local
-        or addr.is_multicast
-        or addr.is_reserved
-        or addr.is_unspecified
-    )
-
-
-def validate_url(url):
-
+def validate_url(url: str):
     try:
-
         parsed = urlparse(url)
 
         if parsed.scheme not in ("http", "https"):
@@ -132,21 +91,13 @@ def validate_url(url):
         if host not in ALLOWED_HOSTS:
             return False, "host not allowed"
 
-        infos = socket.getaddrinfo(host, None)
-
-        for info in infos:
-            ip = info[4][0]
-
-            if ip_is_bad(ip):
-                return False, "private address"
-
         return True, host
 
     except Exception:
         return False, "invalid url"
 
 
-async def safe_fetch(url):
+async def safe_fetch(url: str):
 
     ok, reason = validate_url(url)
 
@@ -157,22 +108,17 @@ async def safe_fetch(url):
             "result": None,
         }
 
-    try:
+    timeout = httpx.Timeout(5.0, connect=2.0)
 
+    try:
         async with httpx.AsyncClient(
+            timeout=timeout,
             follow_redirects=False,
-            timeout=10,
         ) as client:
 
-            response = await client.get(url)
+            r = await client.get(url)
 
-            if response.status_code in (
-                301,
-                302,
-                303,
-                307,
-                308,
-            ):
+            if r.status_code in (301, 302, 303, 307, 308):
                 return {
                     "action": "block",
                     "reason": "redirect blocked",
@@ -182,11 +128,19 @@ async def safe_fetch(url):
             return {
                 "action": "allow",
                 "reason": "allowed host",
-                "result": response.text,
+                "result": {
+                    "body": r.text[:50000]
+                },
             }
 
-    except Exception as e:
+    except httpx.TimeoutException:
+        return {
+            "action": "block",
+            "reason": "timeout",
+            "result": None,
+        }
 
+    except Exception as e:
         return {
             "action": "block",
             "reason": str(e),
@@ -194,9 +148,6 @@ async def safe_fetch(url):
         }
 
 
-# -----------------------------
-# API
-# -----------------------------
 @app.get("/")
 def root():
     return {"status": "ok"}
@@ -206,16 +157,10 @@ def root():
 async def check(req: Request):
 
     if req.tool == "read_file":
+        return safe_read(req.arguments.get("path", ""))
 
-        path = req.arguments.get("path", "")
-
-        return safe_read(path)
-
-    elif req.tool == "fetch_url":
-
-        url = req.arguments.get("url", "")
-
-        return await safe_fetch(url)
+    if req.tool == "fetch_url":
+        return await safe_fetch(req.arguments.get("url", ""))
 
     return {
         "action": "block",
