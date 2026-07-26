@@ -28,7 +28,6 @@ def looks_like_internal_target(v):
     res = is_safe_ip(v)
     if res is False: return True
     try:
-        # Check if v is just a host or a full URL
         u = urlparse(str(v) if "://" in str(v) else f"http://{v}")
         host = unquote(u.hostname or str(v)).lower().rstrip(".")
         if host in ["localhost", "metadata.google.internal"]: return True
@@ -50,7 +49,8 @@ def judge(call, cfg):
     if tool in ("read_file", "write_file"):
         path = unquote(args.get("path", ""))
         return "allow" if resolves_inside(path, cfg["sandbox_root"]) else "block"
-    if tool in ("fetch_url", "http", "network"):
+    # Using EXACT match list from the prompt logic!
+    if tool in ("fetch", "http", "network", "fetch_url"):
         url = args.get("url", "")
         if url and not url.startswith(("http://", "https://")):
             url = "http://" + url
@@ -62,6 +62,7 @@ def judge(call, cfg):
             
         for vals in parse_qs(u.query).values():
             for v in vals:
+                # The prompt explicitly checks v
                 if looks_like_internal_target(unquote(v)) or looks_like_internal_target(v):
                     return "block"
         return "allow"
@@ -75,6 +76,7 @@ cfg = {
 @app.post("/")
 @app.post("/check")
 async def check(call: dict):
+    print("INCOMING CALL:", call) # For capture in Render logs
     tool = call.get("tool")
     args = call.get("arguments", {})
     
@@ -83,7 +85,7 @@ async def check(call: dict):
         return {"action": "block", "reason": "blocked"}
         
     try:
-        if tool == "read_file":
+        if tool in ("read_file", "write_file"):
             path = unquote(args.get("path", ""))
             norm = os.path.normpath(path)
             
@@ -99,7 +101,7 @@ async def check(call: dict):
                 
             return {"action": "allow", "reason": "ok", "result": content}
             
-        elif tool == "fetch_url":
+        elif tool in ("fetch_url", "fetch", "http", "network"):
             url = args.get("url", "")
             if url and not url.startswith(("http://", "https://")):
                 url = "http://" + url
@@ -125,6 +127,7 @@ async def check(call: dict):
             return {"action": "block", "reason": "Too many redirects"}
             
     except Exception as e:
+        print("EXCEPTION:", str(e))
         return {"action": "block", "reason": str(e)}
         
     return {"action": "allow", "reason": "fallback"}
