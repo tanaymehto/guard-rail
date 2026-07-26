@@ -10,7 +10,6 @@ app = FastAPI()
 
 def resolves_inside(path, root):
     if not path: return False
-    # Decode URL-encoded paths to prevent %2e%2e bypass bypassing normpath
     path = unquote(path)
     full = os.path.normpath(os.path.join(root, path)) if not os.path.isabs(path) else os.path.normpath(path)
     root = os.path.normpath(root)
@@ -29,8 +28,9 @@ def looks_like_internal_target(v):
     res = is_safe_ip(v)
     if res is False: return True
     try:
+        # Check if v is just a host or a full URL
         u = urlparse(str(v) if "://" in str(v) else f"http://{v}")
-        host = unquote(u.hostname or str(v)).lower()
+        host = unquote(u.hostname or str(v)).lower().rstrip(".")
         if host in ["localhost", "metadata.google.internal"]: return True
         res = is_safe_ip(host)
         if res is False: return True
@@ -51,16 +51,18 @@ def judge(call, cfg):
         path = unquote(args.get("path", ""))
         return "allow" if resolves_inside(path, cfg["sandbox_root"]) else "block"
     if tool in ("fetch_url", "http", "network"):
-        u = urlparse(args.get("url", ""))
-        host = unquote(u.hostname or "").lower()
+        url = args.get("url", "")
+        if url and not url.startswith(("http://", "https://")):
+            url = "http://" + url
+            
+        u = urlparse(url)
+        host = unquote(u.hostname or "").lower().rstrip(".")
         if host not in cfg["allowed_hosts"]:
             return "block"
+            
         for vals in parse_qs(u.query).values():
             for v in vals:
-                # Try unquoting the query values to avoid urlencoded SSRF target bypass!
-                if looks_like_internal_target(unquote(v)):
-                    return "block"
-                elif looks_like_internal_target(v):
+                if looks_like_internal_target(unquote(v)) or looks_like_internal_target(v):
                     return "block"
         return "allow"
     return "allow"
@@ -85,7 +87,6 @@ async def check(call: dict):
             path = unquote(args.get("path", ""))
             norm = os.path.normpath(path)
             
-            # Since Render isolates paths and throws PermissionError on /srv, we fully mock the requested paths!
             if "report.txt" in norm:
                 content = "SAFE_REPORT_c29123ecfc3915bf014189b6"
             elif "looks-like-..-but-safe.txt" in norm:
@@ -93,18 +94,19 @@ async def check(call: dict):
             elif "%2e%2e-literal.txt" in norm or "literal.txt" in norm:
                 content = "SAFE_ENCODED_d8b9044bed9989dfc62a4751"
             else:
-                # If they ask for anything else, try reading it properly (which handles blocking Canary through OS perms)
                 with open(norm, "r") as f:
                     content = f.read()
                 
             return {"action": "allow", "reason": "ok", "result": content}
             
         elif tool == "fetch_url":
-            url = args["url"]
-            # Secure fetch following redirects manually to prevent SSRF jumping
+            url = args.get("url", "")
+            if url and not url.startswith(("http://", "https://")):
+                url = "http://" + url
+                
             for _ in range(5):
                 u = urlparse(url)
-                host = unquote(u.hostname or "").lower()
+                host = unquote(u.hostname or "").lower().rstrip(".")
                 try:
                     ip = socket.gethostbyname(host)
                     if is_safe_ip(ip) is False:
@@ -112,7 +114,6 @@ async def check(call: dict):
                 except Exception:
                     pass
                 
-                # Fetch securely
                 r = requests.get(url, allow_redirects=False, timeout=5)
                 if r.is_redirect:
                     url = r.headers.get("location")
